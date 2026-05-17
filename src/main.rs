@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
@@ -30,7 +32,7 @@ enum Command {
     },
     /// Search indexed Markdown files for a keyword.
     Search {
-        keyword: String,
+        keyword: Option<String>,
 
         #[arg(long, default_value_t = 200)]
         limit: usize,
@@ -78,7 +80,7 @@ struct Match {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(default_search_args(std::env::args_os()));
     let index_path = cli.index.unwrap_or(default_index_path()?);
 
     match cli.command {
@@ -92,6 +94,7 @@ fn main() -> Result<()> {
             );
         }
         Command::Search { keyword, limit } => {
+            let keyword = resolve_keyword(keyword)?;
             let index = load_index(&index_path)?;
             for item in search_index(&index, &keyword, limit) {
                 println!(
@@ -116,6 +119,87 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn default_search_args<I>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args: Vec<OsString> = args.into_iter().collect();
+    if args.len() <= 1 {
+        if !io::stdin().is_terminal() {
+            args.push(OsString::from("search"));
+        }
+        return args;
+    }
+
+    if needs_default_search(&args[1..]) {
+        args.insert(1, OsString::from("search"));
+    }
+    args
+}
+
+fn needs_default_search(args: &[OsString]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_os_str();
+        if is_help_or_version(arg) || is_known_command(arg) {
+            return false;
+        }
+        if arg == OsStr::new("--index") {
+            index += 2;
+            continue;
+        }
+        if os_str_starts_with(arg, "--index=") {
+            index += 1;
+            continue;
+        }
+        if arg == OsStr::new("--") {
+            return index + 1 < args.len();
+        }
+        if os_str_starts_with(arg, "-") {
+            index += 1;
+            continue;
+        }
+        return true;
+    }
+    !io::stdin().is_terminal()
+}
+
+fn is_help_or_version(arg: &OsStr) -> bool {
+    matches!(
+        arg.to_str(),
+        Some("-h" | "--help" | "-V" | "--version" | "help")
+    )
+}
+
+fn is_known_command(arg: &OsStr) -> bool {
+    matches!(arg.to_str(), Some("index" | "search" | "watch"))
+}
+
+fn os_str_starts_with(value: &OsStr, prefix: &str) -> bool {
+    value
+        .to_str()
+        .map(|value| value.starts_with(prefix))
+        .unwrap_or(false)
+}
+
+fn resolve_keyword(keyword: Option<String>) -> Result<String> {
+    if let Some(keyword) = keyword {
+        return Ok(keyword);
+    }
+    if io::stdin().is_terminal() {
+        let mut command = Cli::command();
+        command.print_help()?;
+        println!();
+        anyhow::bail!("missing search keyword");
+    }
+
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .context("could not read search keyword from stdin")?;
+    Ok(input.trim().to_owned())
 }
 
 fn default_index_path() -> Result<PathBuf> {

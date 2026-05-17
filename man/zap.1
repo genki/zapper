@@ -1,0 +1,97 @@
+.TH ZAP 1 "2026-05-18" "zapper 0.1.0" "User Commands"
+.SH NAME
+zap \- local Markdown search engine
+.SH SYNOPSIS
+.B zap
+[\fB--index\fR \fIPATH\fR]
+\fIKEYWORD\fR
+.br
+.B zap
+[\fB--index\fR \fIPATH\fR]
+\fBsearch\fR
+[\fB--limit\fR \fIN\fR]
+[\fIKEYWORD\fR]
+.br
+.B zap
+[\fB--index\fR \fIPATH\fR]
+\fBindex\fR
+[\fB--root\fR \fIPATH\fR]
+.br
+.B zap
+[\fB--index\fR \fIPATH\fR]
+\fBwatch\fR
+[\fB--root\fR \fIPATH\fR]
+[\fB--debounce-ms\fR \fIMS\fR]
+[\fB--poll-seconds\fR \fISECONDS\fR]
+.SH DESCRIPTION
+.B zap
+indexes local Markdown files and searches them with literal,
+case-insensitive keyword matching.
+.PP
+The
+.B search
+subcommand is the default. For example,
+.B zap agent-post
+is equivalent to
+.B zap search agent-post.
+.PP
+When no keyword argument is supplied to
+.B search
+and standard input is not a terminal,
+.B zap
+reads the search keyword from standard input. This allows pipe usage such as:
+.PP
+.RS
+printf 'agent-post' | zap --limit 5
+.RE
+.SH COMMANDS
+.TP
+.B search [--limit N] [KEYWORD]
+Search the current index. Output is tab-separated:
+full path, 1-based line number, 1-based character position, and line text.
+.TP
+.B index [--root PATH]
+Build or rebuild the Markdown index for a directory tree.
+.TP
+.B watch [--root PATH] [--debounce-ms MS] [--poll-seconds SECONDS]
+Build the index and keep it updated. By default this uses recursive filesystem
+notifications. With
+.B --poll-seconds,
+the tree is scanned periodically, which is useful for broad trees such as a
+home directory.
+.SH OPTIONS
+.TP
+.B --index PATH
+Use a custom index file path. The default is
+.B $XDG_DATA_HOME/zapper/index.json
+or
+.B ~/.local/share/zapper/index.json.
+.TP
+.B --limit N
+Limit the number of search results. The default is 200.
+.TP
+.B --root PATH
+Directory tree to index or watch. The default is the current directory.
+.SH EXAMPLES
+.TP
+Build an index:
+.B zap index --root /home/vagrant
+.TP
+Search with the default subcommand:
+.B zap agent-post
+.TP
+Search from a pipe:
+.B printf 'agent-post' | zap --limit 5
+.TP
+Run a polling watcher:
+.B zap watch --root /home/vagrant --poll-seconds 10
+.SH FILES
+.TP
+.B ~/.local/share/zapper/index.json
+Default index file.
+.TP
+.B /usr/local/share/man/man1/zap.1
+Installed manual page.
+.SH SEE ALSO
+.BR grep (1),
+.BR systemd (1)

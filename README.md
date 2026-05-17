@@ -18,6 +18,19 @@ Search:
 zap search "keyword"
 ```
 
+The `search` subcommand is the default, so this is equivalent:
+
+```sh
+zap "keyword"
+```
+
+`search` also accepts the keyword from stdin when it is piped:
+
+```sh
+printf 'keyword' | zap --limit 20
+printf 'keyword' | zap search --limit 20
+```
+
 Run the watcher in the foreground:
 
 ```sh
@@ -54,8 +67,15 @@ Install example:
 cargo build --release
 sudo install -m 0755 target/release/zap /usr/local/bin/zap
 sudo install -m 0644 packaging/systemd/zapper.service /etc/systemd/system/zapper.service
+sudo install -D -m 0644 man/zap.1 /usr/local/share/man/man1/zap.1
 sudo systemctl daemon-reload
 sudo systemctl enable --now zapper.service
+```
+
+After installing the manual page:
+
+```sh
+man zap
 ```
 
 ## Output
