@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=vagrant
 WorkingDirectory=/home/vagrant
-ExecStart=/usr/local/bin/zap --index /home/vagrant/.local/share/zapper/index.json watch --root /home/vagrant --poll-seconds 10
+ExecStart=/usr/local/bin/zap --index /home/vagrant/.local/share/zapper/index.json watch --root /home/vagrant
 Restart=always
 RestartSec=3
 

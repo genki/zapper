@@ -8,6 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use glob::glob;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
@@ -19,6 +21,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     index: Option<PathBuf>,
 
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -27,8 +32,14 @@ struct Cli {
 enum Command {
     /// Build or rebuild the Markdown index.
     Index {
-        #[arg(long, default_value = ".", value_name = "PATH")]
-        root: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        root: Option<PathBuf>,
+
+        #[arg(long)]
+        all: bool,
+
+        #[arg(long = "include", value_name = "GLOB")]
+        include_patterns: Vec<String>,
     },
     /// Search indexed Markdown files for a keyword.
     Search {
@@ -39,8 +50,14 @@ enum Command {
     },
     /// Watch Markdown files and update the index when they change.
     Watch {
-        #[arg(long, default_value = ".", value_name = "PATH")]
-        root: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        root: Option<PathBuf>,
+
+        #[arg(long)]
+        all: bool,
+
+        #[arg(long = "include", value_name = "GLOB")]
+        include_patterns: Vec<String>,
 
         #[arg(long, default_value_t = 500)]
         debounce_ms: u64,
@@ -71,6 +88,23 @@ struct FileState {
     size: u64,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ZapConfig {
+    root: Option<PathBuf>,
+    index: Option<PathBuf>,
+    all: Option<bool>,
+    include_patterns: Option<Vec<String>>,
+    watch_patterns: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+struct Scope {
+    root: PathBuf,
+    all: bool,
+    include: GlobSet,
+    watch_patterns: Vec<String>,
+}
+
 #[derive(Debug)]
 struct Match {
     path: PathBuf,
@@ -81,11 +115,20 @@ struct Match {
 
 fn main() -> Result<()> {
     let cli = Cli::parse_from(default_search_args(std::env::args_os()));
-    let index_path = cli.index.unwrap_or(default_index_path()?);
+    let config = load_config(cli.config.as_deref())?;
+    let index_path = match cli.index.or(config.index.clone()) {
+        Some(path) => path,
+        None => default_index_path()?,
+    };
 
     match cli.command {
-        Command::Index { root } => {
-            let index = build_index(&root)?;
+        Command::Index {
+            root,
+            all,
+            include_patterns,
+        } => {
+            let scope = make_scope(root, all, include_patterns, &config)?;
+            let index = build_index(&scope)?;
             save_index(&index_path, &index)?;
             eprintln!(
                 "indexed {} markdown files into {}",
@@ -108,10 +151,12 @@ fn main() -> Result<()> {
         }
         Command::Watch {
             root,
+            all,
+            include_patterns,
             debounce_ms,
             poll_seconds,
         } => watch(
-            root,
+            make_scope(root, all, include_patterns, &config)?,
             index_path,
             Duration::from_millis(debounce_ms),
             poll_seconds.map(Duration::from_secs),
@@ -146,11 +191,11 @@ fn needs_default_search(args: &[OsString]) -> bool {
         if is_help_or_version(arg) || is_known_command(arg) {
             return false;
         }
-        if arg == OsStr::new("--index") {
+        if arg == OsStr::new("--index") || arg == OsStr::new("--config") {
             index += 2;
             continue;
         }
-        if os_str_starts_with(arg, "--index=") {
+        if os_str_starts_with(arg, "--index=") || os_str_starts_with(arg, "--config=") {
             index += 1;
             continue;
         }
@@ -209,9 +254,106 @@ fn default_index_path() -> Result<PathBuf> {
     Ok(base.join("zapper/index.json"))
 }
 
-fn build_index(root: &Path) -> Result<Index> {
-    let root = fs::canonicalize(root)
+fn default_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|base| base.join("zapper/config.json"))
+}
+
+fn load_config(path: Option<&Path>) -> Result<ZapConfig> {
+    let Some(path) = path.map(Path::to_path_buf).or_else(default_config_path) else {
+        return Ok(ZapConfig::default());
+    };
+    if !path.is_file() {
+        return Ok(ZapConfig::default());
+    }
+    let data =
+        fs::read(&path).with_context(|| format!("could not read config {}", path.display()))?;
+    serde_json::from_slice(&data)
+        .with_context(|| format!("could not parse config {}", path.display()))
+}
+
+fn make_scope(
+    root: Option<PathBuf>,
+    all: bool,
+    include_patterns: Vec<String>,
+    config: &ZapConfig,
+) -> Result<Scope> {
+    let root = root
+        .or_else(|| config.root.clone())
+        .unwrap_or(std::env::current_dir().context("could not resolve current directory")?);
+    let root = fs::canonicalize(&root)
         .with_context(|| format!("could not resolve root {}", root.display()))?;
+    let all = all || config.all.unwrap_or(false);
+    let include_patterns = if include_patterns.is_empty() {
+        config
+            .include_patterns
+            .clone()
+            .unwrap_or_else(|| default_include_patterns(&root))
+    } else {
+        include_patterns
+    };
+    let watch_patterns = config
+        .watch_patterns
+        .clone()
+        .unwrap_or_else(|| default_watch_patterns(&root));
+    let include = build_glob_set(&root, &include_patterns)?;
+
+    Ok(Scope {
+        root,
+        all,
+        include,
+        watch_patterns,
+    })
+}
+
+fn build_glob_set(root: &Path, patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(
+            GlobBuilder::new(&normalize_pattern(root, pattern))
+                .literal_separator(true)
+                .build()?,
+        );
+    }
+    Ok(builder.build()?)
+}
+
+fn default_include_patterns(root: &Path) -> Vec<String> {
+    let bases = ["*.md", "*.markdown", "*.mdown"];
+    let prefixes = ["", "*/", "*/memo/**/"];
+    prefixes
+        .iter()
+        .flat_map(|prefix| {
+            bases
+                .iter()
+                .map(move |base| root.join(format!("{prefix}{base}")))
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn default_watch_patterns(root: &Path) -> Vec<String> {
+    ["", "*/", "*/memo/", "*/memo/**/"]
+        .iter()
+        .map(|pattern| root.join(pattern).to_string_lossy().into_owned())
+        .collect()
+}
+
+fn normalize_pattern(root: &Path, pattern: &str) -> String {
+    if let Some(home_pattern) = pattern.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(home_pattern).to_string_lossy().into_owned();
+        }
+    }
+    let path = Path::new(pattern);
+    if path.is_absolute() {
+        pattern.to_owned()
+    } else {
+        root.join(path).to_string_lossy().into_owned()
+    }
+}
+
+fn build_index(scope: &Scope) -> Result<Index> {
+    let root = &scope.root;
     let mut files = BTreeMap::new();
 
     for entry in WalkDir::new(&root)
@@ -226,7 +368,7 @@ fn build_index(root: &Path) -> Result<Index> {
                 continue;
             }
         };
-        if !entry.file_type().is_file() || !is_markdown(entry.path()) {
+        if !entry.file_type().is_file() || !is_indexed_markdown(scope, entry.path()) {
             continue;
         }
 
@@ -242,7 +384,7 @@ fn build_index(root: &Path) -> Result<Index> {
 
     Ok(Index {
         version: 1,
-        root,
+        root: root.clone(),
         generated_at: unix_now(),
         files,
     })
@@ -250,8 +392,12 @@ fn build_index(root: &Path) -> Result<Index> {
 
 fn should_descend(entry: &DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
-    !matches!(
-        name.as_ref(),
+    !is_excluded_name(&name)
+}
+
+fn is_excluded_name(name: &str) -> bool {
+    matches!(
+        name,
         ".git"
             | "target"
             | "node_modules"
@@ -276,6 +422,13 @@ fn is_markdown(path: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn is_indexed_markdown(scope: &Scope, path: &Path) -> bool {
+    if !is_markdown(path) {
+        return false;
+    }
+    scope.all || scope.include.is_match(path)
 }
 
 fn index_file(path: &Path) -> Result<IndexedFile> {
@@ -352,39 +505,59 @@ fn char_column(line: &str, byte_idx: usize) -> usize {
 }
 
 fn watch(
-    root: PathBuf,
+    scope: Scope,
     index_path: PathBuf,
     debounce: Duration,
     poll_interval: Option<Duration>,
 ) -> Result<()> {
     if let Some(interval) = poll_interval {
-        return watch_by_polling(root, index_path, interval);
+        return watch_by_polling(scope, index_path, interval);
     }
 
-    rebuild(&root, &index_path)?;
+    rebuild(&scope, &index_path)?;
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-    watcher.watch(&root, RecursiveMode::Recursive)?;
+    let mut watched_dirs = watch_scope(&scope, &mut watcher)?;
     eprintln!(
-        "watching {} and writing {}",
-        root.display(),
+        "watching {} directories under {} with {} scope and writing {}",
+        watched_dirs,
+        scope.root.display(),
+        if scope.all {
+            "all"
+        } else {
+            "configured-pattern"
+        },
         index_path.display()
     );
 
     loop {
         match rx.recv() {
             Ok(Ok(event)) => {
+                for path in &event.paths {
+                    if path.is_dir() && should_watch_path(path) {
+                        match watch_new_directory(&scope, path, &mut watcher) {
+                            Ok(count) => {
+                                if count > 0 {
+                                    watched_dirs += count;
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("watch add failed for {}: {err:#}", path.display())
+                            }
+                        }
+                    }
+                }
                 if !event
                     .paths
                     .iter()
-                    .any(|path| path.is_dir() || is_markdown(path))
+                    .any(|path| should_rebuild_for_event_path(&scope, path))
                 {
                     continue;
                 }
                 std::thread::sleep(debounce);
                 drain_pending(&rx);
-                if let Err(err) = rebuild(&root, &index_path) {
+                if let Err(err) = rebuild(&scope, &index_path) {
                     eprintln!("index update failed: {err:#}");
                 }
             }
@@ -394,20 +567,129 @@ fn watch(
     }
 }
 
-fn watch_by_polling(root: PathBuf, index_path: PathBuf, interval: Duration) -> Result<()> {
-    let mut state = rebuild_with_state(&root, &index_path)?;
+fn watch_scope(scope: &Scope, watcher: &mut RecommendedWatcher) -> Result<usize> {
+    if scope.all {
+        return watch_directory_tree(&scope.root, watcher);
+    }
+    watch_configured_scope(scope, watcher)
+}
+
+fn watch_directory_tree(root: &Path, watcher: &mut RecommendedWatcher) -> Result<usize> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("could not resolve watch root {}", root.display()))?;
+    let mut count = 0;
+
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(should_descend)
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("skip watch entry: {err}");
+                continue;
+            }
+        };
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        match watcher.watch(entry.path(), RecursiveMode::NonRecursive) {
+            Ok(()) => count += 1,
+            Err(err) => eprintln!("skip watch {}: {err:#}", entry.path().display()),
+        }
+    }
+
+    Ok(count)
+}
+
+fn watch_configured_scope(scope: &Scope, watcher: &mut RecommendedWatcher) -> Result<usize> {
+    let mut watched = BTreeMap::new();
+    for pattern in &scope.watch_patterns {
+        for path in glob(&normalize_pattern(&scope.root, pattern))? {
+            let path = match path {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!("skip watch glob entry: {err}");
+                    continue;
+                }
+            };
+            if !path.is_dir() || !should_watch_path(&path) {
+                continue;
+            }
+            watched.insert(fs::canonicalize(&path).unwrap_or(path), ());
+        }
+    }
+
+    let mut count = 0;
+    for path in watched.keys() {
+        count += watch_one_directory(path, watcher);
+    }
+    Ok(count)
+}
+
+fn watch_one_directory(path: &Path, watcher: &mut RecommendedWatcher) -> usize {
+    match watcher.watch(path, RecursiveMode::NonRecursive) {
+        Ok(()) => 1,
+        Err(err) => {
+            eprintln!("skip watch {}: {err:#}", path.display());
+            0
+        }
+    }
+}
+
+fn watch_new_directory(
+    scope: &Scope,
+    path: &Path,
+    watcher: &mut RecommendedWatcher,
+) -> Result<usize> {
+    if scope.all {
+        return watch_directory_tree(path, watcher);
+    }
+    if !is_configured_watch_directory(scope, path) {
+        return Ok(0);
+    }
+    Ok(watch_one_directory(path, watcher))
+}
+
+fn should_watch_path(path: &Path) -> bool {
+    path.components().all(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        !is_excluded_name(&name)
+    })
+}
+
+fn is_configured_watch_directory(scope: &Scope, path: &Path) -> bool {
+    scope.watch_patterns.iter().any(|pattern| {
+        GlobBuilder::new(&normalize_pattern(&scope.root, pattern))
+            .literal_separator(true)
+            .build()
+            .map(|glob| glob.compile_matcher().is_match(path))
+            .unwrap_or(false)
+    })
+}
+
+fn should_rebuild_for_event_path(scope: &Scope, path: &Path) -> bool {
+    if path.is_dir() {
+        return scope.all || is_configured_watch_directory(scope, path);
+    }
+    is_indexed_markdown(scope, path)
+}
+
+fn watch_by_polling(scope: Scope, index_path: PathBuf, interval: Duration) -> Result<()> {
+    let mut state = rebuild_with_state(&scope, &index_path)?;
     eprintln!(
         "polling {} every {}s and writing {}",
-        root.display(),
+        scope.root.display(),
         interval.as_secs(),
         index_path.display()
     );
 
     loop {
         std::thread::sleep(interval);
-        let next_state = collect_file_state(&root)?;
+        let next_state = collect_file_state(&scope)?;
         if next_state != state {
-            match rebuild_with_state(&root, &index_path) {
+            match rebuild_with_state(&scope, &index_path) {
                 Ok(updated) => state = updated,
                 Err(err) => eprintln!("index update failed: {err:#}"),
             }
@@ -419,16 +701,16 @@ fn drain_pending(rx: &mpsc::Receiver<notify::Result<notify::Event>>) {
     while rx.try_recv().is_ok() {}
 }
 
-fn rebuild(root: &Path, index_path: &Path) -> Result<()> {
-    let index = build_index(root)?;
+fn rebuild(scope: &Scope, index_path: &Path) -> Result<()> {
+    let index = build_index(scope)?;
     let count = index.files.len();
     save_index(index_path, &index)?;
     eprintln!("indexed {count} markdown files");
     Ok(())
 }
 
-fn rebuild_with_state(root: &Path, index_path: &Path) -> Result<BTreeMap<PathBuf, FileState>> {
-    let index = build_index(root)?;
+fn rebuild_with_state(scope: &Scope, index_path: &Path) -> Result<BTreeMap<PathBuf, FileState>> {
+    let index = build_index(scope)?;
     let count = index.files.len();
     let state = index
         .files
@@ -448,9 +730,8 @@ fn rebuild_with_state(root: &Path, index_path: &Path) -> Result<BTreeMap<PathBuf
     Ok(state)
 }
 
-fn collect_file_state(root: &Path) -> Result<BTreeMap<PathBuf, FileState>> {
-    let root = fs::canonicalize(root)
-        .with_context(|| format!("could not resolve root {}", root.display()))?;
+fn collect_file_state(scope: &Scope) -> Result<BTreeMap<PathBuf, FileState>> {
+    let root = &scope.root;
     let mut files = BTreeMap::new();
 
     for entry in WalkDir::new(&root)
@@ -465,7 +746,7 @@ fn collect_file_state(root: &Path) -> Result<BTreeMap<PathBuf, FileState>> {
                 continue;
             }
         };
-        if !entry.file_type().is_file() || !is_markdown(entry.path()) {
+        if !entry.file_type().is_file() || !is_indexed_markdown(scope, entry.path()) {
             continue;
         }
         match fs::metadata(entry.path()) {
