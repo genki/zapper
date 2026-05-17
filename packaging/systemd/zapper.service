@@ -1,0 +1,14 @@
+[Unit]
+Description=zapper Markdown index watcher
+After=network.target
+
+[Service]
+Type=simple
+User=vagrant
+WorkingDirectory=/home/vagrant
+ExecStart=/usr/local/bin/zap --index /home/vagrant/.local/share/zapper/index.json watch --root /home/vagrant --poll-seconds 10
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
