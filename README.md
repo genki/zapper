@@ -4,6 +4,15 @@
 
 It indexes Markdown files, watches for changes, and returns keyword matches as full paths with line and column positions.
 
+## v0.2
+
+Version `0.2.0` adds:
+
+- token-protected HTTP search API with `zap serve`
+- remote API federation with `zap search --remote ... --remote-token ...`
+- `--no-local` for remote-only searches
+- remote result paths in `<host>:/path/to/markdown` form
+
 ## v0.1
 
 Version `0.1.0` provides:
