@@ -4,11 +4,22 @@
 
 It indexes Markdown files, watches for changes, and returns keyword matches as full paths with line and column positions.
 
+The crates.io package is `s21g-zapper`; it installs the `zap` binary.
+
+## v2.1
+
+Version `2.1.0` changes the remote API transport to HTTPS only:
+
+- `zap serve` requires `--tls-cert` and `--tls-key`
+- `zap search --remote` accepts only `https://` endpoints
+- self-signed remote certificates are trusted with `--remote-ca-cert` or `remotes[].ca_cert`
+- plain HTTP remote API transport is removed because tokens are sent with each request
+
 ## v0.2
 
 Version `0.2.0` adds:
 
-- token-protected HTTP search API with `zap serve`
+- token-protected search API with `zap serve`
 - remote API federation with `zap search --remote ... --remote-token ...`
 - `--no-local` for remote-only searches
 - remote result paths in `<host>:/path/to/markdown` form
@@ -27,7 +38,7 @@ Version `0.1.0` provides:
 - search results with full path, 1-based line number, 1-based character position, and line text
 - `search` as the default command, so `zap keyword` works
 - stdin keyword input, so `printf 'keyword' | zap` works
-- token-protected HTTP search API with `zap serve`
+- token-protected HTTPS search API with `zap serve`
 - remote API federation with `zap search --remote ... --remote-token ...`
 - a systemd watcher service template
 - a `zap(1)` manual page
@@ -79,26 +90,33 @@ Run the watcher in the foreground:
 zap watch --root /home/vagrant
 ```
 
-Serve a token-protected search API:
+Serve a token-protected HTTPS search API:
 
 ```sh
-ZAP_API_TOKEN='change-me' zap serve --bind 127.0.0.1:8765 --host-label host1
+ZAP_API_TOKEN='change-me' zap serve \
+  --bind 127.0.0.1:8765 \
+  --host-label host1 \
+  --tls-cert /path/to/host1.crt \
+  --tls-key /path/to/host1.key
 ```
 
-Search another zapper API endpoint. Remote endpoints currently use plain HTTP:
+Search another zapper API endpoint. Remote endpoints require HTTPS. For a
+self-signed certificate, pass the certificate as the remote CA certificate:
 
 ```sh
 zap search "keyword" \
-  --remote http://host1:8765/search \
-  --remote-token 'change-me'
+  --remote https://host1:8765/search \
+  --remote-token 'change-me' \
+  --remote-ca-cert /path/to/host1.crt
 ```
 
 Use only remote results:
 
 ```sh
 zap search "keyword" --no-local \
-  --remote http://host1:8765/search \
-  --remote-token 'change-me'
+  --remote https://host1:8765/search \
+  --remote-token 'change-me' \
+  --remote-ca-cert /path/to/host1.crt
 ```
 
 Remote result paths are prefixed with the remote host label:
@@ -158,11 +176,14 @@ Example config:
   ],
   "api_token": "server-token-for-zap-serve",
   "host_label": "this-host",
+  "tls_cert": "/home/vagrant/.config/zapper/this-host.crt",
+  "tls_key": "/home/vagrant/.config/zapper/this-host.key",
   "remotes": [
     {
-      "endpoint": "http://other-host:8765/search",
+      "endpoint": "https://other-host:8765/search",
       "token": "remote-token",
-      "host": "other-host"
+      "host": "other-host",
+      "ca_cert": "/home/vagrant/.config/zapper/other-host.crt"
     }
   ]
 }
@@ -171,9 +192,10 @@ Example config:
 `include_patterns` decide which Markdown files are indexed. `watch_patterns`
 decide which directories get filesystem notification watches. Relative patterns
 are resolved from `root`; `~/` is expanded to the current user's home directory.
-`api_token` and `host_label` are used by `zap serve`. `remotes` are searched
-alongside local results by `zap search`. Remote endpoints currently support
-`http://host:port/search`.
+`api_token`, `host_label`, `tls_cert`, and `tls_key` are used by `zap serve`.
+`remotes` are searched alongside local results by `zap search`. Remote
+endpoints must use `https://host:port/search`; plain HTTP remote API transport
+is not supported because tokens are sent with each request.
 
 ## Watcher service
 

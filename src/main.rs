@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -12,6 +12,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use glob::glob;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
+};
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
@@ -55,6 +59,9 @@ enum Command {
         #[arg(long = "remote-token", value_name = "TOKEN")]
         remote_tokens: Vec<String>,
 
+        #[arg(long = "remote-ca-cert", value_name = "PATH")]
+        remote_ca_certs: Vec<PathBuf>,
+
         #[arg(long)]
         no_local: bool,
     },
@@ -75,7 +82,7 @@ enum Command {
         #[arg(long, value_name = "SECONDS")]
         poll_seconds: Option<u64>,
     },
-    /// Serve the search API over HTTP.
+    /// Serve the search API over HTTPS.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: SocketAddr,
@@ -85,6 +92,12 @@ enum Command {
 
         #[arg(long, value_name = "HOST")]
         host_label: Option<String>,
+
+        #[arg(long = "tls-cert", value_name = "PATH")]
+        tls_cert: Option<PathBuf>,
+
+        #[arg(long = "tls-key", value_name = "PATH")]
+        tls_key: Option<PathBuf>,
     },
 }
 
@@ -118,6 +131,8 @@ struct ZapConfig {
     watch_patterns: Option<Vec<String>>,
     api_token: Option<String>,
     host_label: Option<String>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
     remotes: Option<Vec<RemoteConfig>>,
 }
 
@@ -142,6 +157,7 @@ struct RemoteConfig {
     endpoint: String,
     token: String,
     host: Option<String>,
+    ca_cert: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,7 +183,7 @@ struct DisplayMatch {
 }
 
 #[derive(Debug)]
-struct HttpEndpoint {
+struct HttpsEndpoint {
     host: String,
     port: u16,
     path: String,
@@ -201,6 +217,7 @@ fn main() -> Result<()> {
             limit,
             remote_endpoints,
             remote_tokens,
+            remote_ca_certs,
             no_local,
         } => {
             let keyword = resolve_keyword(keyword)?;
@@ -213,7 +230,9 @@ fn main() -> Result<()> {
                         .map(DisplayMatch::from),
                 );
             }
-            for remote in resolve_remotes(&config, remote_endpoints, remote_tokens)? {
+            for remote in
+                resolve_remotes(&config, remote_endpoints, remote_tokens, remote_ca_certs)?
+            {
                 match search_remote(&remote, &keyword, limit) {
                     Ok(remote_results) => results.extend(remote_results),
                     Err(err) => eprintln!("remote search failed for {}: {err:#}", remote.endpoint),
@@ -242,6 +261,8 @@ fn main() -> Result<()> {
             bind,
             token,
             host_label,
+            tls_cert,
+            tls_key,
         } => serve_search_api(
             index_path,
             bind,
@@ -249,6 +270,12 @@ fn main() -> Result<()> {
                 "API token is required; use --token, ZAP_API_TOKEN, or config api_token",
             )?,
             host_label.or(config.host_label),
+            tls_cert
+                .or(config.tls_cert)
+                .context("TLS certificate is required; use --tls-cert or config tls_cert")?,
+            tls_key
+                .or(config.tls_key)
+                .context("TLS private key is required; use --tls-key or config tls_key")?,
         )?,
     }
 
@@ -593,6 +620,7 @@ fn resolve_remotes(
     config: &ZapConfig,
     endpoints: Vec<String>,
     tokens: Vec<String>,
+    ca_certs: Vec<PathBuf>,
 ) -> Result<Vec<RemoteConfig>> {
     let mut remotes = config.remotes.clone().unwrap_or_default();
     if endpoints.is_empty() {
@@ -602,6 +630,11 @@ fn resolve_remotes(
     if tokens.len() != endpoints.len() && tokens.len() != 1 {
         anyhow::bail!("--remote-token must be specified once for all remotes or once per --remote");
     }
+    if !ca_certs.is_empty() && ca_certs.len() != endpoints.len() && ca_certs.len() != 1 {
+        anyhow::bail!(
+            "--remote-ca-cert must be specified once for all remotes or once per --remote"
+        );
+    }
 
     for (index, endpoint) in endpoints.into_iter().enumerate() {
         let token = if tokens.len() == 1 {
@@ -609,10 +642,18 @@ fn resolve_remotes(
         } else {
             tokens[index].clone()
         };
+        let ca_cert = if ca_certs.is_empty() {
+            None
+        } else if ca_certs.len() == 1 {
+            Some(ca_certs[0].clone())
+        } else {
+            Some(ca_certs[index].clone())
+        };
         remotes.push(RemoteConfig {
             endpoint,
             token,
             host: None,
+            ca_cert,
         });
     }
 
@@ -620,8 +661,12 @@ fn resolve_remotes(
 }
 
 fn search_remote(remote: &RemoteConfig, keyword: &str, limit: usize) -> Result<Vec<DisplayMatch>> {
-    let endpoint = parse_http_endpoint(&remote.endpoint)?;
-    let response = remote_get_search(&endpoint, &remote.token, keyword, limit)?;
+    let endpoint = parse_https_endpoint(&remote.endpoint)?;
+    let ca_cert = remote
+        .ca_cert
+        .as_deref()
+        .context("remote CA certificate is required for HTTPS; use --remote-ca-cert or config remotes[].ca_cert")?;
+    let response = remote_get_search(&endpoint, ca_cert, &remote.token, keyword, limit)?;
 
     let host = remote
         .host
@@ -649,9 +694,9 @@ fn search_remote(remote: &RemoteConfig, keyword: &str, limit: usize) -> Result<V
         .collect())
 }
 
-fn parse_http_endpoint(endpoint: &str) -> Result<HttpEndpoint> {
-    let Some(rest) = endpoint.strip_prefix("http://") else {
-        anyhow::bail!("only http:// zapper endpoints are supported: {endpoint}");
+fn parse_https_endpoint(endpoint: &str) -> Result<HttpsEndpoint> {
+    let Some(rest) = endpoint.strip_prefix("https://") else {
+        anyhow::bail!("only https:// zapper endpoints are supported: {endpoint}");
     };
     let (authority, path) = rest.split_once('/').unwrap_or((rest, "search"));
     let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
@@ -660,7 +705,7 @@ fn parse_http_endpoint(endpoint: &str) -> Result<HttpEndpoint> {
             port.parse().context("invalid endpoint port")?,
         )
     } else {
-        (authority.to_owned(), 80)
+        (authority.to_owned(), 443)
     };
     if host.is_empty() {
         anyhow::bail!("endpoint host is empty: {endpoint}");
@@ -670,18 +715,25 @@ fn parse_http_endpoint(endpoint: &str) -> Result<HttpEndpoint> {
     } else {
         format!("/{path}")
     };
-    Ok(HttpEndpoint { host, port, path })
+    Ok(HttpsEndpoint { host, port, path })
 }
 
 fn remote_get_search(
-    endpoint: &HttpEndpoint,
+    endpoint: &HttpsEndpoint,
+    ca_cert: &Path,
     token: &str,
     keyword: &str,
     limit: usize,
 ) -> Result<ApiSearchResponse> {
     let addr = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream =
+    let tcp_stream =
         TcpStream::connect(&addr).with_context(|| format!("could not connect to {addr}"))?;
+    let server_name = ServerName::try_from(endpoint.host.clone())
+        .with_context(|| format!("invalid TLS server name {}", endpoint.host))?;
+    let client_config = Arc::new(load_client_tls_config(ca_cert)?);
+    let connection = ClientConnection::new(client_config, server_name)
+        .context("could not create TLS client connection")?;
+    let mut stream = StreamOwned::new(connection, tcp_stream);
     let path = format!(
         "{}?q={}&limit={}",
         endpoint.path,
@@ -695,7 +747,11 @@ fn remote_get_search(
     )?;
 
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    match stream.read_to_end(&mut response) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {}
+        Err(err) => return Err(err).context("could not read HTTPS response"),
+    }
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -713,23 +769,81 @@ fn remote_get_search(
     serde_json::from_slice(&response[header_end + 4..]).context("invalid JSON response")
 }
 
+fn load_client_tls_config(ca_cert: &Path) -> Result<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    for cert in load_certificates(ca_cert)? {
+        roots
+            .add(cert)
+            .with_context(|| format!("could not add CA certificate {}", ca_cert.display()))?;
+    }
+    Ok(ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
+fn load_server_tls_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
+    let certs = load_certificates(cert_path)?;
+    if certs.is_empty() {
+        anyhow::bail!(
+            "TLS certificate file has no certificates: {}",
+            cert_path.display()
+        );
+    }
+    let key = load_private_key(key_path)?;
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .with_context(|| {
+            format!(
+                "could not configure TLS with cert {} and key {}",
+                cert_path.display(),
+                key_path.display()
+            )
+        })
+}
+
+fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let data = fs::read(path)
+        .with_context(|| format!("could not read certificate file {}", path.display()))?;
+    rustls_pemfile::certs(&mut &data[..])
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("could not parse certificate file {}", path.display()))
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let data =
+        fs::read(path).with_context(|| format!("could not read private key {}", path.display()))?;
+    rustls_pemfile::private_key(&mut &data[..])
+        .with_context(|| format!("could not parse private key {}", path.display()))?
+        .with_context(|| format!("private key file has no key: {}", path.display()))
+}
+
 fn serve_search_api(
     index_path: PathBuf,
     bind: SocketAddr,
     token: String,
     host_label: Option<String>,
+    tls_cert: PathBuf,
+    tls_key: PathBuf,
 ) -> Result<()> {
     if token.is_empty() {
         anyhow::bail!("API token must not be empty");
     }
     let host_label = host_label.unwrap_or_else(default_host_label);
+    let tls_config = Arc::new(load_server_tls_config(&tls_cert, &tls_key)?);
     let listener = TcpListener::bind(bind).with_context(|| format!("could not bind {bind}"))?;
-    eprintln!("serving zap search API on http://{bind}/search as {host_label}");
+    eprintln!("serving zap search API on https://{bind}/search as {host_label}");
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(err) = handle_api_connection(stream, &index_path, &token, &host_label) {
+                let connection = ServerConnection::new(tls_config.clone())
+                    .context("could not create TLS server connection");
+                let result = connection.and_then(|connection| {
+                    let stream = StreamOwned::new(connection, stream);
+                    handle_api_connection(stream, &index_path, &token, &host_label)
+                });
+                if let Err(err) = result {
                     eprintln!("API request failed: {err:#}");
                 }
             }
@@ -740,13 +854,16 @@ fn serve_search_api(
     Ok(())
 }
 
-fn handle_api_connection(
-    mut stream: TcpStream,
+fn handle_api_connection<S>(
+    mut stream: S,
     index_path: &Path,
     token: &str,
     host_label: &str,
-) -> Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+) -> Result<()>
+where
+    S: Read + Write,
+{
+    let mut reader = BufReader::new(&mut stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     if request_line.trim().is_empty() {
@@ -763,6 +880,7 @@ fn handle_api_connection(
         }
         headers.push(trimmed.to_owned());
     }
+    drop(reader);
 
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
@@ -825,7 +943,11 @@ fn api_token_matches(headers: &[String], token: &str) -> bool {
     })
 }
 
-fn write_json_response<T: Serialize>(stream: &mut TcpStream, status: u16, value: &T) -> Result<()> {
+fn write_json_response<S, T>(stream: &mut S, status: u16, value: &T) -> Result<()>
+where
+    S: Write,
+    T: Serialize,
+{
     let body = serde_json::to_vec(value)?;
     let reason = reason_phrase(status);
     write!(
@@ -837,7 +959,10 @@ fn write_json_response<T: Serialize>(stream: &mut TcpStream, status: u16, value:
     Ok(())
 }
 
-fn write_text_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
+fn write_text_response<S>(stream: &mut S, status: u16, body: &str) -> Result<()>
+where
+    S: Write,
+{
     let reason = reason_phrase(status);
     write!(
         stream,

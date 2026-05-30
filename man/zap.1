@@ -1,4 +1,4 @@
-.TH ZAP 1 "2026-05-30" "zapper 0.2.0" "User Commands"
+.TH ZAP 1 "2026-05-30" "zapper 2.1.0" "User Commands"
 .SH NAME
 zap \- local Markdown search engine
 .SH SYNOPSIS
@@ -135,6 +135,17 @@ or the config key
 Host label returned by
 .B serve
 and used as the remote path prefix.
+.TP
+.B --tls-cert PATH
+Certificate file for HTTPS
+.B serve.
+.TP
+.B --tls-key PATH
+Private key file for HTTPS
+.B serve.
+.TP
+.B --remote-ca-cert PATH
+CA or self-signed certificate file used to verify an HTTPS remote API.
 .SH CONFIG
 The config file is JSON. Supported keys are:
 .B root,
@@ -144,6 +155,8 @@ The config file is JSON. Supported keys are:
 .B watch_patterns,
 .B api_token,
 .B host_label,
+.B tls_cert,
+.B tls_key,
 and
 .B remotes.
 .PP
@@ -159,11 +172,14 @@ Example:
   "watch_patterns": ["~", "~/*", "~/*/memo", "~/*/memo/**"],
   "api_token": "server-token",
   "host_label": "this-host",
+  "tls_cert": "/home/vagrant/.config/zapper/this-host.crt",
+  "tls_key": "/home/vagrant/.config/zapper/this-host.key",
   "remotes": [
     {
-      "endpoint": "http://other-host:8765/search",
+      "endpoint": "https://other-host:8765/search",
       "token": "remote-token",
-      "host": "other-host"
+      "host": "other-host",
+      "ca_cert": "/home/vagrant/.config/zapper/other-host.crt"
     }
   ]
 }
@@ -184,10 +200,10 @@ Run a polling watcher:
 .B zap watch --root /home/vagrant --poll-seconds 10
 .TP
 Serve the search API:
-.B ZAP_API_TOKEN=secret zap serve --bind 0.0.0.0:8765 --host-label host1
+.B ZAP_API_TOKEN=secret zap serve --bind 0.0.0.0:8765 --host-label host1 --tls-cert host1.crt --tls-key host1.key
 .TP
 Search a remote API:
-.B zap search agent-post --remote http://host1:8765/search --remote-token secret
+.B zap search agent-post --remote https://host1:8765/search --remote-token secret --remote-ca-cert host1.crt
 .TP
 Index every Markdown file under the root:
 .B zap index --root /home/vagrant --all
@@ -203,7 +219,8 @@ requires either
 or
 .B X-Zap-Token: TOKEN.
 Remote endpoints currently support
-.B http://host:port/search.
+.B https://host:port/search.
+Plain HTTP remote API transport is not supported.
 .SH FILES
 .TP
 .B ~/.local/share/zapper/index.json
