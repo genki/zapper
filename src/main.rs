@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,6 +48,15 @@ enum Command {
 
         #[arg(long, default_value_t = 200)]
         limit: usize,
+
+        #[arg(long = "remote", value_name = "URL")]
+        remote_endpoints: Vec<String>,
+
+        #[arg(long = "remote-token", value_name = "TOKEN")]
+        remote_tokens: Vec<String>,
+
+        #[arg(long)]
+        no_local: bool,
     },
     /// Watch Markdown files and update the index when they change.
     Watch {
@@ -64,6 +74,17 @@ enum Command {
 
         #[arg(long, value_name = "SECONDS")]
         poll_seconds: Option<u64>,
+    },
+    /// Serve the search API over HTTP.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        bind: SocketAddr,
+
+        #[arg(long, value_name = "TOKEN", env = "ZAP_API_TOKEN")]
+        token: Option<String>,
+
+        #[arg(long, value_name = "HOST")]
+        host_label: Option<String>,
     },
 }
 
@@ -95,6 +116,9 @@ struct ZapConfig {
     all: Option<bool>,
     include_patterns: Option<Vec<String>>,
     watch_patterns: Option<Vec<String>>,
+    api_token: Option<String>,
+    host_label: Option<String>,
+    remotes: Option<Vec<RemoteConfig>>,
 }
 
 #[derive(Debug)]
@@ -111,6 +135,42 @@ struct Match {
     line_number: usize,
     column: usize,
     line: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RemoteConfig {
+    endpoint: String,
+    token: String,
+    host: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ApiSearchResponse {
+    host: String,
+    matches: Vec<ApiMatch>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ApiMatch {
+    path: String,
+    line_number: usize,
+    column: usize,
+    line: String,
+}
+
+#[derive(Debug)]
+struct DisplayMatch {
+    path: String,
+    line_number: usize,
+    column: usize,
+    line: String,
+}
+
+#[derive(Debug)]
+struct HttpEndpoint {
+    host: String,
+    port: u16,
+    path: String,
 }
 
 fn main() -> Result<()> {
@@ -136,16 +196,33 @@ fn main() -> Result<()> {
                 index_path.display()
             );
         }
-        Command::Search { keyword, limit } => {
+        Command::Search {
+            keyword,
+            limit,
+            remote_endpoints,
+            remote_tokens,
+            no_local,
+        } => {
             let keyword = resolve_keyword(keyword)?;
-            let index = load_index(&index_path)?;
-            for item in search_index(&index, &keyword, limit) {
+            let mut results = Vec::new();
+            if !no_local {
+                let index = load_index(&index_path)?;
+                results.extend(
+                    search_index(&index, &keyword, limit)
+                        .into_iter()
+                        .map(DisplayMatch::from),
+                );
+            }
+            for remote in resolve_remotes(&config, remote_endpoints, remote_tokens)? {
+                match search_remote(&remote, &keyword, limit) {
+                    Ok(remote_results) => results.extend(remote_results),
+                    Err(err) => eprintln!("remote search failed for {}: {err:#}", remote.endpoint),
+                }
+            }
+            for item in results.into_iter().take(limit) {
                 println!(
                     "{}\t{}\t{}\t{}",
-                    item.path.display(),
-                    item.line_number,
-                    item.column,
-                    item.line
+                    item.path, item.line_number, item.column, item.line
                 );
             }
         }
@@ -160,6 +237,18 @@ fn main() -> Result<()> {
             index_path,
             Duration::from_millis(debounce_ms),
             poll_seconds.map(Duration::from_secs),
+        )?,
+        Command::Serve {
+            bind,
+            token,
+            host_label,
+        } => serve_search_api(
+            index_path,
+            bind,
+            token.or(config.api_token).context(
+                "API token is required; use --token, ZAP_API_TOKEN, or config api_token",
+            )?,
+            host_label.or(config.host_label),
         )?,
     }
 
@@ -219,7 +308,7 @@ fn is_help_or_version(arg: &OsStr) -> bool {
 }
 
 fn is_known_command(arg: &OsStr) -> bool {
-    matches!(arg.to_str(), Some("index" | "search" | "watch"))
+    matches!(arg.to_str(), Some("index" | "search" | "watch" | "serve"))
 }
 
 fn os_str_starts_with(value: &OsStr, prefix: &str) -> bool {
@@ -489,6 +578,362 @@ fn search_index(index: &Index, keyword: &str, limit: usize) -> Vec<Match> {
     matches
 }
 
+impl From<Match> for DisplayMatch {
+    fn from(value: Match) -> Self {
+        Self {
+            path: value.path.display().to_string(),
+            line_number: value.line_number,
+            column: value.column,
+            line: value.line,
+        }
+    }
+}
+
+fn resolve_remotes(
+    config: &ZapConfig,
+    endpoints: Vec<String>,
+    tokens: Vec<String>,
+) -> Result<Vec<RemoteConfig>> {
+    let mut remotes = config.remotes.clone().unwrap_or_default();
+    if endpoints.is_empty() {
+        return Ok(remotes);
+    }
+
+    if tokens.len() != endpoints.len() && tokens.len() != 1 {
+        anyhow::bail!("--remote-token must be specified once for all remotes or once per --remote");
+    }
+
+    for (index, endpoint) in endpoints.into_iter().enumerate() {
+        let token = if tokens.len() == 1 {
+            tokens[0].clone()
+        } else {
+            tokens[index].clone()
+        };
+        remotes.push(RemoteConfig {
+            endpoint,
+            token,
+            host: None,
+        });
+    }
+
+    Ok(remotes)
+}
+
+fn search_remote(remote: &RemoteConfig, keyword: &str, limit: usize) -> Result<Vec<DisplayMatch>> {
+    let endpoint = parse_http_endpoint(&remote.endpoint)?;
+    let response = remote_get_search(&endpoint, &remote.token, keyword, limit)?;
+
+    let host = remote
+        .host
+        .clone()
+        .filter(|host| !host.is_empty())
+        .or_else(|| {
+            if response.host.is_empty() {
+                None
+            } else {
+                Some(response.host)
+            }
+        })
+        .or_else(|| Some(endpoint.host.clone()))
+        .unwrap_or_else(|| "remote".to_owned());
+
+    Ok(response
+        .matches
+        .into_iter()
+        .map(|item| DisplayMatch {
+            path: format!("{host}:{}", item.path),
+            line_number: item.line_number,
+            column: item.column,
+            line: item.line,
+        })
+        .collect())
+}
+
+fn parse_http_endpoint(endpoint: &str) -> Result<HttpEndpoint> {
+    let Some(rest) = endpoint.strip_prefix("http://") else {
+        anyhow::bail!("only http:// zapper endpoints are supported: {endpoint}");
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, "search"));
+    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+        (
+            host.to_owned(),
+            port.parse().context("invalid endpoint port")?,
+        )
+    } else {
+        (authority.to_owned(), 80)
+    };
+    if host.is_empty() {
+        anyhow::bail!("endpoint host is empty: {endpoint}");
+    }
+    let path = if path.is_empty() {
+        "/search".to_owned()
+    } else {
+        format!("/{path}")
+    };
+    Ok(HttpEndpoint { host, port, path })
+}
+
+fn remote_get_search(
+    endpoint: &HttpEndpoint,
+    token: &str,
+    keyword: &str,
+    limit: usize,
+) -> Result<ApiSearchResponse> {
+    let addr = format!("{}:{}", endpoint.host, endpoint.port);
+    let mut stream =
+        TcpStream::connect(&addr).with_context(|| format!("could not connect to {addr}"))?;
+    let path = format!(
+        "{}?q={}&limit={}",
+        endpoint.path,
+        percent_encode(keyword),
+        limit
+    );
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nX-Zap-Token: {token}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        endpoint.host
+    )?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .context("invalid HTTP response")?;
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .context("invalid HTTP status")?;
+    if status != 200 {
+        anyhow::bail!("remote API returned HTTP {status}");
+    }
+    serde_json::from_slice(&response[header_end + 4..]).context("invalid JSON response")
+}
+
+fn serve_search_api(
+    index_path: PathBuf,
+    bind: SocketAddr,
+    token: String,
+    host_label: Option<String>,
+) -> Result<()> {
+    if token.is_empty() {
+        anyhow::bail!("API token must not be empty");
+    }
+    let host_label = host_label.unwrap_or_else(default_host_label);
+    let listener = TcpListener::bind(bind).with_context(|| format!("could not bind {bind}"))?;
+    eprintln!("serving zap search API on http://{bind}/search as {host_label}");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                if let Err(err) = handle_api_connection(stream, &index_path, &token, &host_label) {
+                    eprintln!("API request failed: {err:#}");
+                }
+            }
+            Err(err) => eprintln!("API accept failed: {err:#}"),
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_api_connection(
+    mut stream: TcpStream,
+    index_path: &Path,
+    token: &str,
+    host_label: &str,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        headers.push(trimmed.to_owned());
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+
+    if method != "GET" {
+        return write_text_response(&mut stream, 405, "method not allowed\n");
+    }
+    if target == "/health" {
+        return write_text_response(&mut stream, 200, "ok\n");
+    }
+    if !api_token_matches(&headers, token) {
+        return write_text_response(&mut stream, 401, "unauthorized\n");
+    }
+
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path != "/search" {
+        return write_text_response(&mut stream, 404, "not found\n");
+    }
+
+    let mut keyword = None;
+    let mut limit = 200usize;
+    for (key, value) in parse_query(query) {
+        match key.as_str() {
+            "q" | "keyword" => keyword = Some(value),
+            "limit" => limit = value.parse().unwrap_or(limit),
+            _ => {}
+        }
+    }
+
+    let Some(keyword) = keyword else {
+        return write_text_response(&mut stream, 400, "missing q\n");
+    };
+
+    let index = load_index(index_path)?;
+    let response = ApiSearchResponse {
+        host: host_label.to_owned(),
+        matches: search_index(&index, &keyword, limit)
+            .into_iter()
+            .map(|item| ApiMatch {
+                path: item.path.display().to_string(),
+                line_number: item.line_number,
+                column: item.column,
+                line: item.line,
+            })
+            .collect(),
+    };
+    write_json_response(&mut stream, 200, &response)
+}
+
+fn api_token_matches(headers: &[String], token: &str) -> bool {
+    headers.iter().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        (name.eq_ignore_ascii_case("authorization") && value == format!("Bearer {token}"))
+            || (name.eq_ignore_ascii_case("x-zap-token") && value == token)
+    })
+}
+
+fn write_json_response<T: Serialize>(stream: &mut TcpStream, status: u16, value: &T) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
+    let reason = reason_phrase(status);
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(&body)?;
+    Ok(())
+}
+
+fn write_text_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
+    let reason = reason_phrase(status);
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )?;
+    Ok(())
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "Error",
+    }
+}
+
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            (percent_decode(key), percent_decode(value))
+        })
+        .collect()
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(*byte as char)
+            }
+            b' ' => output.push('+'),
+            byte => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
+}
+
+fn percent_decode(value: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut iter = value.as_bytes().iter().copied().peekable();
+    while let Some(byte) = iter.next() {
+        match byte {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let hi = iter.next();
+                let lo = iter.next();
+                match (hi.and_then(hex_value), lo.and_then(hex_value)) {
+                    (Some(hi), Some(lo)) => bytes.push((hi << 4) | lo),
+                    _ => {
+                        bytes.push(b'%');
+                        if let Some(hi) = hi {
+                            bytes.push(hi);
+                        }
+                        if let Some(lo) = lo {
+                            bytes.push(lo);
+                        }
+                    }
+                }
+            }
+            byte => bytes.push(byte),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn default_host_label() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "localhost".to_owned())
+}
+
 fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
     let mut positions = Vec::new();
     let mut offset = 0;
@@ -540,6 +985,7 @@ fn watch(
                             Ok(count) => {
                                 if count > 0 {
                                     watched_dirs += count;
+                                    eprintln!("watching {watched_dirs} directories");
                                 }
                             }
                             Err(err) => {

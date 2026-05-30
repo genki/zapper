@@ -29,6 +29,14 @@ zap \- local Markdown search engine
 [\fB--all\fR]
 [\fB--debounce-ms\fR \fIMS\fR]
 [\fB--poll-seconds\fR \fISECONDS\fR]
+.br
+.B zap
+[\fB--index\fR \fIPATH\fR]
+[\fB--config\fR \fIPATH\fR]
+\fBserve\fR
+[\fB--bind\fR \fIADDR:PORT\fR]
+[\fB--token\fR \fITOKEN\fR]
+[\fB--host-label\fR \fIHOST\fR]
 .SH DESCRIPTION
 .B zap
 indexes local Markdown files and searches them with literal,
@@ -70,6 +78,12 @@ printf 'agent-post' | zap --limit 5
 .B search [--limit N] [KEYWORD]
 Search the current index. Output is tab-separated:
 full path, 1-based line number, 1-based character position, and line text.
+Use
+.B --remote URL --remote-token TOKEN
+to include a token-protected remote zapper API. Use
+.B --no-local
+to show only remote results. Remote paths are printed as
+.B HOST:/path/to/file.md.
 .TP
 .B index [--root PATH] [--all]
 Build or rebuild the Markdown index for a directory tree.
@@ -102,14 +116,36 @@ Directory tree to index or watch. The default is the current directory.
 .B --all
 Index or watch every Markdown file under the root instead of the default
 workspace patterns.
+.TP
+.B --bind ADDR:PORT
+Address for
+.B serve
+to listen on. The default is
+.B 127.0.0.1:8765.
+.TP
+.B --token TOKEN
+Bearer token for
+.B serve.
+It may also be supplied with
+.B ZAP_API_TOKEN
+or the config key
+.B api_token.
+.TP
+.B --host-label HOST
+Host label returned by
+.B serve
+and used as the remote path prefix.
 .SH CONFIG
 The config file is JSON. Supported keys are:
 .B root,
 .B index,
 .B all,
 .B include_patterns,
+.B watch_patterns,
+.B api_token,
+.B host_label,
 and
-.B watch_patterns.
+.B remotes.
 .PP
 Example:
 .PP
@@ -120,7 +156,16 @@ Example:
   "index": "/home/vagrant/.local/share/zapper/index.json",
   "all": false,
   "include_patterns": ["~/*.md", "~/*/*.md", "~/*/memo/**/*.md"],
-  "watch_patterns": ["~", "~/*", "~/*/memo", "~/*/memo/**"]
+  "watch_patterns": ["~", "~/*", "~/*/memo", "~/*/memo/**"],
+  "api_token": "server-token",
+  "host_label": "this-host",
+  "remotes": [
+    {
+      "endpoint": "http://other-host:8765/search",
+      "token": "remote-token",
+      "host": "other-host"
+    }
+  ]
 }
 .fi
 .RE
@@ -138,8 +183,27 @@ Search from a pipe:
 Run a polling watcher:
 .B zap watch --root /home/vagrant --poll-seconds 10
 .TP
+Serve the search API:
+.B ZAP_API_TOKEN=secret zap serve --bind 0.0.0.0:8765 --host-label host1
+.TP
+Search a remote API:
+.B zap search agent-post --remote http://host1:8765/search --remote-token secret
+.TP
 Index every Markdown file under the root:
 .B zap index --root /home/vagrant --all
+.SH API
+.B zap serve
+provides
+.B GET /health
+and
+.B GET /search?q=KEYWORD&limit=N.
+.B /search
+requires either
+.B Authorization: Bearer TOKEN
+or
+.B X-Zap-Token: TOKEN.
+Remote endpoints currently support
+.B http://host:port/search.
 .SH FILES
 .TP
 .B ~/.local/share/zapper/index.json
