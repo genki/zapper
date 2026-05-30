@@ -1,5 +1,9 @@
 # zapper
 
+<p align="center">
+  <img src="assets/logo.png" alt="zapper product logo" width="180">
+</p>
+
 `zapper` is a local Markdown search engine. The CLI command is `zap`.
 
 It indexes Markdown files, watches for changes, and returns keyword matches as full paths with line and column positions.
